@@ -3,8 +3,17 @@ import uuid
 from src.rag_model.rag_conversational import create_vectorstore, query_llm
 from typing import List,Dict
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],  
+    allow_headers=["*"], 
+)
 
 @app.post("/upload-pdf/")
 async def upload_pdf(session_id: str, file: UploadFile = File(...)):
