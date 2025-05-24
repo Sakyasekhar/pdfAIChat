@@ -4,18 +4,20 @@ import time
 #imports
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
+from langchain.chains.llm import LLMChain
+from langchain.chains.summarize import load_summarize_chain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import  create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder,PromptTemplate
 from pinecone import  Pinecone,ServerlessSpec
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 import asyncio
 import fitz  # PyMuPDF
+from .summary.graph import app as summary_graph
+from .summary.states import OverallState
 
 
 # Load environment variables from .env
@@ -26,8 +28,11 @@ load_dotenv()
 pc = Pinecone()
 
 # Define the embedding model
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", api_key=os.getenv("GEMINI_API_KEY"))
+from .config import embeddings
 #embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+# Create a ChatOpenAI model
+from .config import llm
 
 index_name = "pdfchatbot"
 spec = ServerlessSpec(
@@ -82,7 +87,10 @@ async def async_upsert_batches(vectors, batch_size=200):
 async def create_vectorstore(pdf, session_id):
     start_time = time.time()
     
-     # Read the PDF file into memory
+    # Delete existing vectors for this session_id
+    index.delete(filter={"session_id": session_id})
+    
+    # Read the PDF file into memory
     file_bytes = pdf.file.read()
     pdf_buffer = BytesIO(file_bytes)
 
@@ -101,14 +109,14 @@ async def create_vectorstore(pdf, session_id):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
     doc_chunks = text_splitter.split_documents([document])
 
-
     # Optimize embedding by using controlled batching
     embeddings_list = await batch_embed_queries(doc_chunks, batch_size=10)  # Smaller batch size improves efficiency
     print(f"Embeddings generated for {len(doc_chunks)} chunks in {time.time() - step1_time:.2f} seconds")
     step2_time = time.time()
 
-    vectors = [(f"{session_id}-{i}", embedding, {"text": doc.page_content,"session_id": session_id}) for i, (doc, embedding) in enumerate(zip(doc_chunks, embeddings_list))]
-
+    # Create vectors with simple counter since we've deleted previous ones
+    vectors = [(f"{session_id}-{i}", embedding, {"text": doc.page_content,"session_id": session_id}) 
+              for i, (doc, embedding) in enumerate(zip(doc_chunks, embeddings_list))]
 
     # Optimize upserts by running them concurrently
     await async_upsert_batches(vectors, batch_size=100)
@@ -163,12 +171,59 @@ qa_prompt = ChatPromptTemplate.from_messages([
 
 
 
-# Create a ChatOpenAI model
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-8b")
 
 
+async def is_summary_request(query):
+    intent_prompt = PromptTemplate(
+        template="""You are a classifier that determines if a user query is asking for a summary.
+        Consider the following types of summary requests:
+        - Direct requests for summaries
+        - Requests to summarize the document
+        - Requests for an overview
+        - Requests for a brief explanation
+        - Requests to explain the main points
+        
+        Query: {query}
+        
+        Respond only with "yes" or "no".""",
+        input_variables=["query"]
+    )
 
-def query_llm(query, chat_historyjson, session_id):
+    chain = LLMChain(llm=llm,prompt=intent_prompt)
+    result =await chain.arun(query=query)
+    result = result.strip().lower()
+
+    return "yes" in result
+
+async def get_summary(session_id):
+    results = index.query(
+            vector=[0.0]*768, 
+            top_k=100,
+            include_metadata=True,
+            filter={"session_id": session_id}
+        )
+    matches = results["matches"]
+
+    # Sort by the numeric part of the ID (after the last '-')
+    sorted_matches = sorted(matches, key=lambda m: int(m["id"].rsplit("-", 1)[-1]))
+
+    contents = [match["metadata"]["text"]for match in sorted_matches]
+
+    #Initial state for the summary graph
+    initial_state: OverallState = {
+        "contents":contents,
+        "summaries":[],
+        "collapsed_summaries":[],
+        "final_summary":""
+    }
+
+    #Run the summary graph
+    summary_graph_state =await summary_graph.ainvoke(initial_state)
+
+    return summary_graph_state["final_summary"]
+
+
+async def query_llm(query, chat_historyjson, session_id):
     chat_history = []
 
     for dir in chat_historyjson:
@@ -177,7 +232,8 @@ def query_llm(query, chat_historyjson, session_id):
         else:
             chat_history.append(SystemMessage(content=dir["AI"]))
     
-
+    if await is_summary_request(query):
+        return await get_summary(session_id)
     
     # Create a retriever for querying the Pinecone vector store
     retriever = PineconeVectorStore(index, embeddings).as_retriever(

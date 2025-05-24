@@ -44,5 +44,5 @@ async def query_pdf(request: QueryRequest):
     - query: The user's question.
     - chat_history: A list of previous messages in the conversation for context.
     """
-    response = query_llm(request.query, request.chat_history, request.session_id)
+    response = await query_llm(request.query, request.chat_history, request.session_id)
     return {"response": response}
