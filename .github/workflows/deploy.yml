@@ -1,0 +1,27 @@
+name: Deploy FastAPI to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            tmux kill-session -t fastapi || true
+            cd pdfAIChat || git clone https://github.com/Sakyasekhar/pdfAIChat.git && cd pdfAIChat
+            git pull origin main
+            poetry install
+            tmux new -d -s fastapi 'poetry run uvicorn main:app --host 0.0.0.0 --port 8000'
