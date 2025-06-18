@@ -48,5 +48,12 @@ async def query_pdf(request: QueryRequest):
             # Send { "chunk": "x" }\n
             yield json.dumps({"chunk": token}) + "\n"
 
-    return StreamingResponse(event_stream(),
-                             media_type="application/x-ndjson")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
