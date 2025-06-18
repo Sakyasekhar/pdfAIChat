@@ -9,7 +9,7 @@ load_dotenv()
 # Define the embedding model
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", api_key=os.getenv("GEMINI_API_KEY"))
 # Create a ChatOpenAI model
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-8b")
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite-preview-06-17")
 
 # Constants
 token_max = 10000  # Maximum tokens before collapsing summaries

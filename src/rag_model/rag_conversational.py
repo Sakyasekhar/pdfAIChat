@@ -1,9 +1,9 @@
 import os
 from io import BytesIO
 import time
+import asyncio
 #imports
 from dotenv import load_dotenv
-from PyPDF2 import PdfReader
 from langchain.chains.llm import LLMChain
 from langchain.chains.summarize import load_summarize_chain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -11,10 +11,8 @@ from langchain.chains import  create_history_aware_retriever, create_retrieval_c
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain_pinecone import PineconeVectorStore
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder,PromptTemplate
-from pinecone import  Pinecone,ServerlessSpec
-import asyncio
 import fitz  # PyMuPDF
 from .summary.graph import app as summary_graph
 from .summary.states import OverallState
@@ -25,64 +23,16 @@ load_dotenv()
 
 
 #vectorDB
-pc = Pinecone()
+from .vector_store import index
 
-# Define the embedding model
-from .config import embeddings
-#embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
-# Create a ChatOpenAI model
-from .config import llm
-
-index_name = "pdfchatbot"
-spec = ServerlessSpec(
-    cloud="aws", region="us-east-1"
-)
-
-# Ensure the index exists
-existing_indexes = [index_info["name"] for index_info in pc.list_indexes()]
-
-if index_name not in existing_indexes:
-    pc.create_index(
-        name=index_name,
-        dimension=768,
-        metric='dotproduct',
-        spec=spec
-    )
-    while not pc.describe_index(index_name).status['ready']:
-        time.sleep(1)
-index = pc.Index(index_name)
-time.sleep(1)
-
-index = pc.Index(index_name)
+#embedding model and Chat model
+from .config import embeddings,llm
 
 
 
-async def batch_embed_queries(chunks, batch_size=10):
-    """Batch embed multiple text chunks while respecting API limits."""
-    loop = asyncio.get_event_loop()
-    
-    tasks = [
-        loop.run_in_executor(None, embeddings.embed_documents, [doc.page_content for doc in chunks[i:i + batch_size]])
-        for i in range(0, len(chunks), batch_size)
-    ]
 
-    embeddings_list_batches = await asyncio.gather(*tasks)
-    embeddings_list = [embedding for batch in embeddings_list_batches for embedding in batch]
-    
-    
-    return embeddings_list
 
-def chunker(seq, batch_size):
-    return (seq[pos:pos + batch_size] for pos in range(0, len(seq), batch_size))
-
-async def async_upsert_batches(vectors, batch_size=200):
-    chunks = list(chunker(vectors, batch_size))
-    async def upsert_chunk(chunk):
-        return await asyncio.to_thread(index.upsert, vectors=chunk, async_req=True)
-
-    tasks = [upsert_chunk(chunk) for chunk in chunks]
-    await asyncio.gather(*tasks)
+from .vector_store import batch_embed_queries,async_upsert_batches
 
 async def create_vectorstore(pdf, session_id):
     start_time = time.time()
@@ -104,8 +54,8 @@ async def create_vectorstore(pdf, session_id):
     print(f"PDF read and text extracted in {time.time() - start_time:.2f} seconds")
     step1_time = time.time()
 
+    # Create document chunks
     document = Document(page_content=pdf_text, metadata={"session_id": session_id})
-
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
     doc_chunks = text_splitter.split_documents([document])
 
@@ -127,50 +77,27 @@ async def create_vectorstore(pdf, session_id):
 
 
 
-#Contextualize question prompt
-# This system prompt helps the AI understand that it should reformulate the question
-# based on the chat history to make it a standalone question
-contextualize_q_system_prompt = (
-    "Given a chat history and the latest user question "
-    "which might reference context in the chat history, "
-    "formulate a standalone question which can be understood "
-    "without the chat history. Do NOT answer the question, just "
-    "reformulate it if needed and otherwise return it as is."
-)
+from .prompts import contextualize_q_prompt,qa_prompt
 
-# Create a prompt template for contextualizing questions
-contextualize_q_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", contextualize_q_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ]
-)
-
-
-
-
-#qa_system prompt (context consists of retrieved document chunks from the vector database, 
-# which are used along with the query to generate an answer)
-qa_system_prompt = (
-    "You are an assistant for question-answering tasks. Use "
-    "the following pieces of retrieved context to answer the "
-    "question. If you don't know the answer, just say that you "
-    "don't know. Use three sentences maximum and keep the answer "
-    "concise."
-    "\n\n"
-    "{context}"
-)
-
-#Create a prompt template for answering questions  (input nothing but query)
-qa_prompt = ChatPromptTemplate.from_messages([
-    ("system",qa_system_prompt),
-    MessagesPlaceholder("chat_history"),
-    ("human","{input}")
-])
-
-
-
+# ------------------------------------------------------------------
+# Helper that turns any LangChain chain into a token generator
+# ------------------------------------------------------------------
+def make_token_stream(chain, chain_input: dict, chunk_size: int = 1):
+    async def _generator():
+        buf = ""
+        async for chunk in chain.astream(chain_input):
+            # LangChain returns dicts like {"answer": "partial text ..."}
+            if not chunk.get("answer"):
+                continue
+            buf += chunk["answer"]
+            # Yield fixed-size pieces (1 token, 3 chars, etc.)
+            while len(buf) >= chunk_size:
+                yield buf[:chunk_size]
+                buf = buf[chunk_size:]
+        # Flush the remainder
+        if buf:
+            yield buf
+    return _generator
 
 
 async def is_summary_request(query):
@@ -217,23 +144,52 @@ async def get_summary(session_id):
         "final_summary":""
     }
 
-    #Run the summary graph
-    summary_graph_state =await summary_graph.ainvoke(initial_state)
+    response = await summary_graph.ainvoke(initial_state)
+    return response["final_summary"]
 
-    return summary_graph_state["final_summary"]
+async def get_summary_streaming(session_id):
+    results = index.query(
+            vector=[0.0]*768, 
+            top_k=100,
+            include_metadata=True,
+            filter={"session_id": session_id}
+        )
+    matches = results["matches"]
 
+    # Sort by the numeric part of the ID (after the last '-')
+    sorted_matches = sorted(matches, key=lambda m: int(m["id"].rsplit("-", 1)[-1]))
+    contents = [match["metadata"]["text"] for match in sorted_matches]
+
+    # Combine all content into one document for streaming summary
+    combined_content = "\n\n".join(contents)
+    
+    # Create a streaming summary using the LLM directly
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that summarizes documents. Write a comprehensive but concise summary of the following document. Focus on the main points and key insights."},
+        {"role": "user", "content": combined_content}
+    ]
+    
+    # Use the streaming version of the LLM
+    async def stream_summary():
+        async for chunk in llm.astream(messages):
+            if chunk.content:
+                yield chunk.content
+    
+    return stream_summary
 
 async def query_llm(query, chat_historyjson, session_id):
     chat_history = []
 
-    for dir in chat_historyjson:
-        if "human" in dir:
-            chat_history.append(HumanMessage(content=dir["human"]))
-        else:
-            chat_history.append(SystemMessage(content=dir["AI"]))
+    for turn in chat_historyjson:
+        # Safely build chat history without KeyErrors
+        if "human" in turn:
+            chat_history.append(HumanMessage(content=turn["human"]))
+        elif "AI" in turn:
+            chat_history.append(AIMessage(content=turn["AI"]))
+        # ignore any malformed turn
     
     if await is_summary_request(query):
-        return await get_summary(session_id)
+        return await get_summary_streaming(session_id)
     
     # Create a retriever for querying the Pinecone vector store
     retriever = PineconeVectorStore(index, embeddings).as_retriever(
@@ -256,8 +212,15 @@ async def query_llm(query, chat_historyjson, session_id):
     # and used effectively for generating an accurate answer.
     rag_chain = create_retrieval_chain(history_aware_retriever, stuff_chain)
 
-    #Process the user's query through the retrieval chain
-    response = rag_chain.invoke({"input": query, "chat_history": chat_history})
+    # #Process the user's query through the retrieval chain
+    # response = rag_chain.invoke({"input": query, "chat_history": chat_history})
 
-    #return the AI's response to frontend to there we can append it to chat_history
-    return response["answer"]
+    # #return the AI's response to frontend to there we can append it to chat_history
+    # return response["answer"]
+
+    token_stream = make_token_stream(
+        rag_chain,
+        {"input": query, "chat_history": chat_history},
+        chunk_size=1,              # 1 character ≈ "typewriter" effect
+    )
+    return token_stream

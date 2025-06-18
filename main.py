@@ -1,9 +1,10 @@
 from fastapi import FastAPI, UploadFile, File
-import uuid
+from fastapi.responses import StreamingResponse
 from src.rag_model.rag_conversational import create_vectorstore, query_llm
 from typing import List,Dict
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+import json
 
 app = FastAPI()
 
@@ -38,11 +39,14 @@ class QueryRequest(BaseModel):
 
 @app.post("/query/")
 async def query_pdf(request: QueryRequest):
-    """
-    Query the LLM using the stored embeddings from a specific session's PDF.
-    - session_id: The unique identifier for the uploaded PDF session.
-    - query: The user's question.
-    - chat_history: A list of previous messages in the conversation for context.
-    """
-    response = await query_llm(request.query, request.chat_history, request.session_id)
-    return {"response": response}
+    stream_fn = await query_llm(request.query,
+                                request.chat_history,
+                                request.session_id)
+
+    async def event_stream():
+        async for token in stream_fn():          # consume generator
+            # Send { "chunk": "x" }\n
+            yield json.dumps({"chunk": token}) + "\n"
+
+    return StreamingResponse(event_stream(),
+                             media_type="application/x-ndjson")
