@@ -5,6 +5,7 @@ from typing import List,Dict
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import json
+import asyncio
 
 app = FastAPI()
 
@@ -50,6 +51,24 @@ async def query_pdf(request: QueryRequest):
 
     return StreamingResponse(
         event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+@app.get("/test-stream")
+async def test_stream():
+    async def generate():
+        for i in range(10):
+            await asyncio.sleep(1)  # 1 second delay
+            yield json.dumps({"chunk": f"Chunk {i} "}) + "\n"
+    
+    return StreamingResponse(           
+        generate(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
