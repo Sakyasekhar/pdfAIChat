@@ -60,7 +60,7 @@ async def query_pdf(request: QueryRequest):
     )
 
 
-@app.get("/test-stream")
+@app.get("/stream-test")
 async def test_stream():
     async def generate():
         for i in range(10):
