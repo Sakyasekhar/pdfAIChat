@@ -58,21 +58,3 @@ async def query_pdf(request: QueryRequest):
             "X-Accel-Buffering": "no",
         }
     )
-
-
-@app.get("/stream-test")
-async def test_stream():
-    async def generate():
-        for i in range(10):
-            await asyncio.sleep(1)  # 1 second delay
-            yield json.dumps({"chunk": f"Chunk {i} "}) + "\n"
-    
-    return StreamingResponse(           
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
